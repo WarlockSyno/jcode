@@ -609,17 +609,7 @@ fn parse_model_info_value(value: &Value) -> Option<ModelInfo> {
     Some(ModelInfo {
         id,
         name,
-        context_length: first_u64_field(
-            object,
-            &[
-                "context_length",
-                "contextLength",
-                "max_context_length",
-                "maxModelLength",
-                "max_model_len",
-                "trainingContextLength",
-            ],
-        ),
+        context_length: resolve_context_length(object),
         pricing: parse_model_pricing(object.get("pricing")),
         created: object.get("created").and_then(value_as_u64),
     })
@@ -628,6 +618,42 @@ fn parse_model_info_value(value: &Value) -> Option<ModelInfo> {
 fn first_u64_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
     keys.iter()
         .find_map(|key| object.get(*key).and_then(value_as_u64))
+}
+
+/// Resolve a model's served context window from a `/v1/models` entry.
+///
+/// llama.cpp/OpenAI-compatible servers nest context under `meta`, reporting
+/// both the served runtime context (`n_ctx`) and the larger training context
+/// (`n_ctx_train`). Priority (issue #403): `meta.n_ctx` > flat catalog keys
+/// (`context_length`, …) > `meta.n_ctx_train`. The training context is only a
+/// last resort — llama.cpp advertises `n_ctx_train` larger than the served
+/// `n_ctx`, which would over-budget requests past real capacity.
+fn resolve_context_length(object: &serde_json::Map<String, Value>) -> Option<u64> {
+    let meta = object.get("meta").and_then(Value::as_object);
+    if let Some(meta) = meta
+        && let Some(n_ctx) = meta.get("n_ctx").and_then(value_as_u64)
+    {
+        return Some(n_ctx);
+    }
+    if let Some(flat) = first_u64_field(
+        object,
+        &[
+            "context_length",
+            "contextLength",
+            "max_context_length",
+            "maxModelLength",
+            "max_model_len",
+            "trainingContextLength",
+        ],
+    ) {
+        return Some(flat);
+    }
+    if let Some(meta) = meta
+        && let Some(n_ctx_train) = meta.get("n_ctx_train").and_then(value_as_u64)
+    {
+        return Some(n_ctx_train);
+    }
+    None
 }
 
 fn value_as_u64(value: &Value) -> Option<u64> {

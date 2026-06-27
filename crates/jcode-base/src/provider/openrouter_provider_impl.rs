@@ -603,6 +603,15 @@ impl Provider for OpenRouterProvider {
 
     fn context_window(&self) -> usize {
         let model_id = self.model();
+        // Explicit per-model `context_window` config wins over the live/disk
+        // catalog. Quantized llama.cpp-style deployments advertise the *training*
+        // context (n_ctx_train) via /v1/models instead of the served runtime
+        // context; trusting that made jcode over-budget past real capacity
+        // (issue #403).
+        let normalized_model_id = model_id.trim().to_ascii_lowercase();
+        if let Some(limit) = self.static_context_limits.get(&normalized_model_id) {
+            return *limit;
+        }
         // Try cached model data from OpenRouter API
         let cache = self.models_cache.try_read();
         if let Ok(cache) = cache
@@ -621,10 +630,6 @@ impl Provider for OpenRouterProvider {
         {
             return ctx as usize;
         }
-        let normalized_model_id = model_id.trim().to_ascii_lowercase();
-        if let Some(limit) = self.static_context_limits.get(&normalized_model_id) {
-            return *limit;
-        }
         if let Some(profile_id) = self.profile_id.as_deref()
             && let Some(limit) = crate::provider_catalog::openai_compatible_profile_context_limit(
                 profile_id, &model_id,
@@ -637,6 +642,16 @@ impl Provider for OpenRouterProvider {
     }
 
     fn fork(&self) -> Arc<dyn Provider> {
+        self.fork_typed()
+    }
+}
+
+impl OpenRouterProvider {
+    /// Fork into a new typed Arc, preserving all config-derived fields
+    /// (static_context_limits, profile_id, api_base, auth, etc.).
+    /// Used by MultiProvider::fork() to avoid creating a fresh new() that
+    /// loses named-provider config (issue #403).
+    pub fn fork_typed(&self) -> Arc<Self> {
         Arc::new(Self {
             client: self.client.clone(),
             model: Arc::new(RwLock::new(

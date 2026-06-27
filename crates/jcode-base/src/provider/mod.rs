@@ -2229,16 +2229,15 @@ impl Provider for MultiProvider {
         } else {
             None
         };
-        let openrouter = if self
+        // fork_typed() instead of new() preserves static_context_limits from
+        // named-provider config (issue #403). new() creates a blank provider
+        // from env that loses per-model context_window overrides.
+        let openrouter = self
             .openrouter
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some()
-        {
-            openrouter::OpenRouterProvider::new().ok().map(Arc::new)
-        } else {
-            None
-        };
+            .as_ref()
+            .map(|p| p.fork_typed());
 
         let provider = Self {
             claude: RwLock::new(claude),

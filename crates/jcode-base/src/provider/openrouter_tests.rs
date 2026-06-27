@@ -137,6 +137,55 @@ fn openai_compatible_models_endpoint_allows_minimal_model_objects() {
 }
 
 #[test]
+fn openai_compatible_models_endpoint_prefers_llama_cpp_runtime_n_ctx() {
+    // Issue #403: llama.cpp nests context under `meta`, reporting both the
+    // served runtime context (`n_ctx`) and the larger training context
+    // (`n_ctx_train`). The parser must use `n_ctx` so budgeting does not
+    // overrun the actually-served context.
+    let parsed = parse_openai_compatible_models_response(
+        r#"{
+            "object": "list",
+            "data": [{
+                "id": "qwen3-local",
+                "meta": { "n_ctx": 131072, "n_ctx_train": 262144 }
+            }]
+        }"#,
+    )
+    .expect("llama.cpp-style /models response should parse");
+
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].context_length, Some(131_072));
+}
+
+#[test]
+fn openai_compatible_models_endpoint_n_ctx_beats_flat_context_length() {
+    // Runtime `n_ctx` must win even when a (possibly stale) flat
+    // `context_length` is also present.
+    let parsed = parse_openai_compatible_models_response(
+        r#"[{ "id": "m", "context_length": 200000, "meta": { "n_ctx": 131072 } }]"#,
+    )
+    .expect("response with both flat and meta context should parse");
+    assert_eq!(parsed[0].context_length, Some(131_072));
+}
+
+#[test]
+fn openai_compatible_models_endpoint_uses_n_ctx_train_only_as_last_resort() {
+    // Flat `context_length` beats training `n_ctx_train`; the training context
+    // is the last-resort fallback (better than None -> wrong family default).
+    let parsed = parse_openai_compatible_models_response(
+        r#"[{ "id": "m", "context_length": 32768, "meta": { "n_ctx_train": 262144 } }]"#,
+    )
+    .expect("response should parse");
+    assert_eq!(parsed[0].context_length, Some(32_768));
+
+    let only_train = parse_openai_compatible_models_response(
+        r#"[{ "id": "m", "meta": { "n_ctx_train": 262144 } }]"#,
+    )
+    .expect("response with only training context should parse");
+    assert_eq!(only_train[0].context_length, Some(262_144));
+}
+
+#[test]
 fn openai_compatible_models_endpoint_allows_chutes_numeric_pricing() {
     let parsed = parse_openai_compatible_models_response(
         r#"{
@@ -1807,6 +1856,160 @@ fn named_openai_compatible_model_context_window_overrides_default() {
         OpenRouterProvider::new_named_openai_compatible("custom", &config).expect("provider");
 
     assert_eq!(provider.context_window(), 512_000);
+}
+
+/// Regression test for issue #403: qwen3-family model with explicit
+/// `context_window = 131072` in config must not be overridden by the
+/// `open_weight_family_context_limit` heuristic (262144 for qwen3).
+#[test]
+fn named_openai_compatible_qwen3_context_window_config_overrides_heuristic() {
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    let mut config = crate::config::NamedProviderConfig {
+        base_url: "https://local-llm.example.test/v1".to_string(),
+        api_key: Some("test".to_string()),
+        default_model: Some("qwen3-local".to_string()),
+        models: vec![crate::config::NamedProviderModelConfig {
+            id: "qwen3-local".to_string(),
+            context_window: Some(131_072),
+            input: Vec::new(),
+        }],
+        ..Default::default()
+    };
+    config.model_catalog = false;
+
+    let provider =
+        OpenRouterProvider::new_named_openai_compatible("local-llm", &config).expect("provider");
+
+    assert_eq!(
+        provider.context_window(),
+        131_072,
+        "explicit context_window config must win over qwen3 family heuristic (262144)"
+    );
+
+    // Simulate fork() path: fresh new() provider should still get correct limit
+    // from global CONTEXT_LIMIT_CACHE (populated by config at startup).
+    // The forked provider has no static_context_limits (from new()), so it must
+    // fall through to the global cache which was seeded from config.
+    crate::provider::populate_context_limits(
+        [("qwen3-local".to_string(), 131_072usize)]
+            .into_iter()
+            .collect(),
+    );
+    assert_eq!(
+        crate::provider::context_limit_for_model("qwen3-local"),
+        Some(131_072),
+        "global cache should return 131072 for qwen3 model when seeded from config"
+    );
+}
+
+/// Regression for issue #403: fork_typed() must preserve static_context_limits.
+/// MultiProvider::fork() previously created a fresh new() which lost per-model
+/// context_window config, causing qwen3 models to get 262144 instead of 131072.
+#[test]
+fn named_openai_compatible_fork_typed_preserves_context_limits() {
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    let mut config = crate::config::NamedProviderConfig {
+        base_url: "https://local-llm.example.test/v1".to_string(),
+        api_key: Some("test".to_string()),
+        default_model: Some("qwen3-local".to_string()),
+        models: vec![crate::config::NamedProviderModelConfig {
+            id: "qwen3-local".to_string(),
+            context_window: Some(131_072),
+            input: Vec::new(),
+        }],
+        ..Default::default()
+    };
+    config.model_catalog = false;
+
+    let provider =
+        OpenRouterProvider::new_named_openai_compatible("local-llm", &config).expect("provider");
+    assert_eq!(provider.context_window(), 131_072);
+
+    // Fork should preserve static_context_limits
+    let forked = provider.fork_typed();
+    assert_eq!(
+        forked.context_window(),
+        131_072,
+        "fork_typed() must preserve static_context_limits from named provider config"
+    );
+}
+
+/// Regression for issue #403 primary cause: an explicit `context_window` from
+/// config must override a live `/v1/models` catalog entry. Quantized llama.cpp
+/// deployments advertise the *training* context (262144) instead of the served
+/// runtime context (131072); jcode must trust the user's explicit override.
+#[test]
+fn context_window_explicit_config_overrides_live_catalog_context_length() {
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    let model_id = "qwen3-local";
+
+    let mut provider = OpenRouterProvider {
+        api_base: "https://local-llm.example.test/v1".to_string(),
+        model: Arc::new(RwLock::new(model_id.to_string())),
+        auth: ProviderAuth::AuthorizationBearer {
+            token: "test".to_string(),
+            label: "OPENAI_COMPAT_API_KEY".to_string(),
+        },
+        supports_provider_features: false,
+        supports_model_catalog: true,
+        profile_id: Some("local-llm".to_string()),
+        reasoning_effort_support: None,
+        static_models: vec![model_id.to_string()],
+        send_openrouter_headers: false,
+        ..make_custom_compatible_provider()
+    };
+    // User's explicit override: 128K.
+    provider.static_context_limits =
+        [(model_id.to_string(), 131_072usize)].into_iter().collect();
+    // Live catalog lies: advertises the 256K training context.
+    provider.models_cache = Arc::new(RwLock::new(ModelsCache {
+        models: vec![ModelInfo {
+            id: model_id.to_string(),
+            name: String::new(),
+            context_length: Some(262_144),
+            pricing: Default::default(),
+            created: None,
+        }],
+        fetched: true,
+        cached_at: None,
+    }));
+
+    assert_eq!(
+        provider.context_window(),
+        131_072,
+        "explicit context_window config must win over live catalog context_length"
+    );
+}
+
+#[test]
+fn named_openai_compatible_strips_profile_prefix_for_context_lookup() {
+    // Issue #403: the provider-qualified runtime id (`<profile>:<model>`) is a
+    // routing artifact, not part of the model id. It must resolve to the bare
+    // id so the configured context_window applies — the qualified id is never a
+    // key in static_context_limits or the global cache.
+    let _lock = ENV_LOCK.lock();
+    let _namespace = EnvVarGuard::remove("JCODE_OPENROUTER_CACHE_NAMESPACE");
+    let config = crate::config::NamedProviderConfig {
+        base_url: "https://local-llm.example.test/v1".to_string(),
+        api_key: Some("test".to_string()),
+        default_model: Some("qwen3-local".to_string()),
+        models: vec![crate::config::NamedProviderModelConfig {
+            id: "qwen3-local".to_string(),
+            context_window: Some(131_072),
+            input: Vec::new(),
+        }],
+        ..Default::default()
+    };
+    let provider =
+        OpenRouterProvider::new_named_openai_compatible("local-llm", &config).expect("provider");
+    assert_eq!(
+        provider.strip_session_profile_prefix("local-llm:qwen3-local"),
+        "qwen3-local",
+        "qualified runtime id must strip to bare id for context lookup"
+    );
 }
 
 #[test]
