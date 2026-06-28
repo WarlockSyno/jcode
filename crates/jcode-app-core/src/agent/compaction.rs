@@ -101,6 +101,21 @@ impl Agent {
             || lower.contains("length limit")
             || lower.contains("maximum tokens")
             || (lower.contains("exceeded") && lower.contains("tokens"))
+            // llama.cpp: {"type":"exceed_context_size_error","message":"request (N tokens) exceeds available context size (M tokens)"}
+            || lower.contains("exceed_context_size_error")
+            || lower.contains("exceeds available context size")
+            || lower.contains("exceeds the available context size")
+    }
+
+    /// Parse actual prompt token count out of a llama.cpp 400 error JSON body.
+    /// Returns None if the error is not in that format.
+    fn parse_n_prompt_tokens_from_error(error: &str) -> Option<u64> {
+        // Error body looks like: {"error":{"n_prompt_tokens":137437,...}}
+        let key = "\"n_prompt_tokens\":";
+        let start = error.find(key)? + key.len();
+        let rest = error[start..].trim_start();
+        let end = rest.find(|c: char| !c.is_ascii_digit())?;
+        rest[..end].parse().ok()
     }
 
     /// Best-effort emergency recovery after a context-limit error.
@@ -129,13 +144,17 @@ impl Agent {
         }
 
         let context_limit = self.provider.context_window() as u64;
+        // Use the actual token count from the error body for calibration when available
+        // (llama.cpp reports n_prompt_tokens in 400 JSON), else fall back to context ceiling.
+        let observed_tokens = Self::parse_n_prompt_tokens_from_error(error)
+            .unwrap_or(context_limit);
         let compaction = self.registry.compaction();
 
         let (dropped, usage_pct) = match compaction.try_write() {
             Ok(mut manager) => {
                 let (dropped, usage_pct) = {
                     let all_messages = self.session.provider_messages();
-                    manager.update_observed_input_tokens(context_limit);
+                    manager.update_observed_input_tokens(observed_tokens);
                     let usage_pct = manager.context_usage_with(all_messages) * 100.0;
                     let dropped = match manager.hard_compact_with(all_messages) {
                         Ok(dropped) => dropped,
